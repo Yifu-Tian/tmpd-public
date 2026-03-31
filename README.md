@@ -5,5 +5,17 @@ This repository implements Topological Motion Planning Diffusion(TMPD) - a metho
 Yifu Tian; Xinhang Xu; Thien-Minh Nguyen; Muqing Cao(2026). **_Topological Motion Planning Diffusion: Generative Tangle-Free Path Planning for Tethered Robots in Obstacle-Rich Environments_**, submitted to IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS).
 
 ---
-This repository implements `TMPD` - Topological Motion Planning Diffusion -, a method for learning and planning robot motions with
-diffusion models, which was submitted to IROS 2026.
+This repository implements `TMPD` - Topological Motion Planning Diffusion -, a method for tethered robots path planning with diffusion models, which was submitted to IROS 2026.
+
+If you have any questions please let me know -- [yifutian@link.cuhk.edu.cn](mailto:yifutian@link.cuhk.edu.cn)
+
+---
+## Installation
+
+
+---
+## Running the TMPD inference
+
+
+---
+## Citation
