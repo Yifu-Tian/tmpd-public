@@ -178,23 +178,3 @@ data_trajectories
 *.pickle
 
 *tar.gz
-
-# -----------------------------------------------------------------------------
-# Local workspace / generated artifacts (TMPD open-source prep)
-# -----------------------------------------------------------------------------
-.codex
-.history/
-Miniconda3-latest-Linux-x86_64.sh
-*.Zone.Identifier
-*:Zone.Identifier
-
-# Inference outputs and benchmark artifacts
-scripts/inference/**/*.png
-scripts/inference/**/*.pkl
-scripts/inference/**/*.pdf
-scripts/inference/**/*.mp4
-scripts/inference/**/logs/
-scripts/inference/**/results/
-
-# Generated local caches
-__pycache__/
