@@ -1,141 +1,195 @@
-This code is deprecated.\
-I am preparing a new version at (soon available): [https://github.com/joaoamcarvalho/mpd-splines](https://github.com/joaoamcarvalho/mpd-splines/).
+# TMPD Public
+
+Topology-aware Motion Planning Diffusion (`TMPD`) built on top of the original MPD codebase.
+
+This repository focuses on **lifelong / multi-segment navigation** in dynamic 2D obstacle fields, and compares:
+
+- `Topo-A*`
+- `Topo-RRT`
+- `Vanilla MPD`
+- `TMPD (Ours)`
+
+The core idea is to augment diffusion-based planning with **global topological memory** (winding-signature based), so each new segment is planned with awareness of previously executed path topology.
 
 ---
 
-# Motion Planning Diffusion: Learning and Planning of Robot Motions with Diffusion Models
+## 1. What This Project Does
 
+Compared to the original MPD release, this repo adds:
 
-Carvalho, J.; Le, A.T.; Baierl, M.; Koert, D.; Peters, J. (2023). **_Motion Planning Diffusion: Learning and Planning of Robot Motions with Diffusion Models_**, IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS).
+- Dynamic environment variants with obstacle dropout + newly inserted obstacles.
+- Topology utility functions:
+  - trajectory signature (`winding number` style)
+  - topological energy evaluation
+  - taut homotopy reference extraction
+  - safety checks for sphere/box obstacles
+- TMPD inference and benchmarking scripts for fair side-by-side comparison with classic topology-aware planners and vanilla MPD.
 
-[<img src="https://img.shields.io/badge/arxiv-%23B31B1B.svg?&style=for-the-badge&logo=arxiv&logoColor=white" />](https://arxiv.org/abs/2308.01557)
+Main implementation files:
 
-
-<p float="middle">
-  <img src="figures/EnvDense2D-RobotPointMass.gif" width="45%" />
-  <img src="figures/EnvSpheres3D-RobotPanda.gif" width="45%" />
-</p>
-
----
-This repository implements `MPD` - Motion Planning Diffusion -, a method for learning and planning robot motions with
-diffusion models, which was presented at IROS 2023.
-
-**NOTES**
-- Since the IROS submission we improve the code for better parallelization and improved the baselines.
-Hence, the results in the paper are slightly outated, but the qualitivative results are still valid.
-- We changed the data generation to use RRT Connect followed by GPMP2, which we found to lead to smoother results.
-- The training of the baseline (CVAE) and comparison with traditional planning methods will be added soon. 
-
-
-If you have any questions please let me know -- [joao@robot-learning.de](mailto:joao@robot-learning.de)
+- `mpd/utils/topology_utils.py`
+- `tmpd_baselines/environment/env_dense_2d_extra_objects.py`
+- `tmpd_baselines/environment/env_simple_2d_extra_objects.py`
+- `scripts/inference/run_astar.py`
+- `scripts/inference/run_rrt.py`
+- `scripts/inference/run_mpd.py`
+- `scripts/inference/run_tmpd.py`
+- `scripts/inference/plot_all_figures.py`
 
 ---
-## Installation
 
-Pre-requisites:
-- Ubuntu 20.04 (maybe works with other OS)
-- [miniconda](https://docs.conda.io/projects/miniconda/en/latest/index.html)
+## 2. Environment Setup
 
-Clone this repository with
+Recommended:
+
+- Ubuntu 20.04+
+- CUDA GPU (for MPD / TMPD runs)
+- Conda
+
+Clone with submodules:
+
 ```bash
-cd ~
-git clone --recurse-submodules https://github.com/jacarvalho/mpd-public.git
-cd mpd-public
+git clone --recurse-submodules https://github.com/Yifu-Tian/tmpd-public.git
+cd tmpd-public
 ```
 
-Download [IsaacGym Preview 4](https://developer.nvidia.com/isaac-gym) and extract it under `deps/isaacgym`
+Download and extract Isaac Gym Preview 4 under `deps/isaacgym`:
+
 ```bash
-mv ~/Downloads/IsaacGym_Preview_4_Package.tar.gz ~/mpd-public/deps/
-cd ~/mpd-public/deps
+mv ~/Downloads/IsaacGym_Preview_4_Package.tar.gz ./deps/
+cd deps
 tar -xvf IsaacGym_Preview_4_Package.tar.gz
+cd ..
 ```
 
-Run the bash setup script to install everything.
-```
-cd ~/mpd-public
+Install dependencies:
+
+```bash
 bash setup.sh
 ```
 
----
-## Running the MPD inference
+`setup.sh` creates the `mpd` conda environment and installs editable local dependencies:
 
-To try out the MPD inference, first download the data and the trained models. 
+- `deps/experiment_launcher`
+- `deps/torch_robotics`
+- `deps/motion_planning_baselines`
+- `deps/isaacgym/python`
+- `deps/storm`
+- this repository (`pip install -e .`)
+
+---
+
+## 3. Prepare Data / Trained Models
+
+The repository intentionally does **not** track heavy artifacts (datasets, checkpoints, benchmark image dumps, pickle logs).
+
+If you want to run inference directly, download the pretrained assets:
 
 ```bash
 conda activate mpd
-```
-
-```bash
 gdown --id 1mmJAFg6M2I1OozZcyueKp_AP0HHkCq2k
 tar -xvf data_trajectories.tar.gz
 gdown --id 1I66PJ5QudCqIZ2Xy4P8e-iRBA8-e2zO1
 tar -xvf data_trained_models.tar.gz
 ```
 
-Run the inference script
-```bash
-cd scripts/inference
-python inference.py
-```
+Expected local directories after extraction:
 
-Comment out the `model-id` variable in `scripts/inference/inference.py` to try out different models
-```python
-model_id: str = 'EnvDense2D-RobotPointMass'
-model_id: str = 'EnvNarrowPassageDense2D-RobotPointMass'
-model_id: str = 'EnvSimple2D-RobotPointMass'
-model_id: str = 'EnvSpheres3D-RobotPanda'
-```
-
-Depending on the task (`model-id`) you might need to change the weights for collision and smoothness (we will provide an "hyperpameter search" soon.)
-```python
-weight_grad_cost_collision: float = 3e-2
-weight_grad_cost_smoothness: float = 1e-2
-```
-
-The results will be saved under `data_trained_models/[model_id]/results_inference/`.
+- `data_trajectories/`
+- `data_trained_models/`
 
 ---
-## Generate data and train from scratch
 
-We recommend running the follwowing in a SLURM cluster.
+## 4. Run Benchmarks
+
+All commands below are run from:
 
 ```bash
-conda activate mpd
+cd scripts/inference
 ```
 
-To regenerate the data:
+Run each method separately:
+
+```bash
+python run_astar.py
+python run_rrt.py
+python run_mpd.py
+python run_tmpd.py
+```
+
+One-click execution (all methods + final comparison plotting):
+
+```bash
+bash run_all.sh
+```
+
+Generate 1x4 comparison figures from shared trial data:
+
+```bash
+python plot_all_figures.py
+```
+
+---
+
+## 5. Data Generation and Training
+
+Generate training trajectories:
+
 ```bash
 cd scripts/generate_data
 python launch_generate_trajectories.py
 ```
 
-To train the model:
+Train diffusion models:
+
 ```bash
 cd scripts/train_diffusion
 python launch_train_01.py
 ```
 
+---
 
+## 6. Repository Layout
 
-
+```text
+mpd/                          # Core MPD modules (datasets, model, trainer, utils)
+tmpd_baselines/               # Dynamic environment variants used by TMPD benchmarks
+scripts/generate_data/        # Trajectory generation pipeline
+scripts/train_diffusion/      # Diffusion model training pipeline
+scripts/inference/            # TMPD + baselines inference/benchmark scripts
+deps/                         # Git submodules (torch_robotics, baselines, etc.)
+figures/                      # Lightweight demo GIFs
+```
 
 ---
-## Citation
 
-If you use our work or code base(s), please cite our article:
-```latex
+## 7. Notes on Open-Source Snapshot
+
+- Large local files and generated benchmark outputs are excluded from Git.
+- This keeps the repo lightweight and reproducible as source code.
+- If you need exact experiment outputs, regenerate them from scripts in `scripts/inference/`.
+
+---
+
+## 8. Citation
+
+If you use the original MPD method, please cite:
+
+```bibtex
 @inproceedings{carvalho2023mpd,
   title={Motion Planning Diffusion: Learning and Planning of Robot Motions with Diffusion Models},
-  author={Carvalho, J. and  Le, A.T. and  Baierl, M. and  Koert, D. and  Peters, J.},
+  author={Carvalho, J. and Le, A.T. and Baierl, M. and Koert, D. and Peters, J.},
   booktitle={IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
   year={2023}
 }
 ```
 
-
 ---
-## Credits
 
-Parts of this work and software were taken and/or inspired from:
-- [https://github.com/jannerm/diffuser](https://github.com/jannerm/diffuser)
+## 9. Acknowledgements
 
+- Original MPD repository and paper:
+  - https://github.com/jacarvalho/mpd-public
+  - https://arxiv.org/abs/2308.01557
+- Diffuser:
+  - https://github.com/jannerm/diffuser
