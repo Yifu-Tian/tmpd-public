@@ -15,7 +15,7 @@ This repository implements `TMPD` (Topological Motion Planning Diffusion), a dif
 
 This codebase is developed based on the [mpd-public](https://github.com/joaoamcarvalho/mpd-public/tree/main).
 
-This repository is still actively maintained and updated. If you encounter any issues, feel free to open an issue or contact us by email: [yifutian@link.cuhk.edu.cn](mailto:yifutian@link.cuhk.edu.cn)
+This repository is still actively maintained and updated. If you encounter any issues, feel free to open an issue or send an email: [yifutian@link.cuhk.edu.cn](mailto:yifutian@link.cuhk.edu.cn)
 
 ---
 ## Installation
