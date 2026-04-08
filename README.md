@@ -1,181 +1,162 @@
-# TMPD Public
+# Topological Motion Planning Diffusion: Generative Tangle-Free Path Planning for Tethered Robots in Obstacle-Rich Environments
 
-Topology-aware Motion Planning Diffusion (`TMPD`) built on top of the original MPD codebase.
+Tian, Y.; Xu, X.; Nguyen, T.-M.; Cao, M. (2026). **_Topological Motion Planning Diffusion: Generative Tangle-Free Path Planning for Tethered Robots in Obstacle-Rich Environments_**, submitted to IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS).
 
-This repository focuses on **lifelong / multi-segment navigation** in dynamic 2D obstacle fields, and compares:
+[<img src="https://img.shields.io/badge/arXiv-2603.26696-b31b1b.svg?&style=for-the-badge&logo=arxiv&logoColor=white" />](https://arxiv.org/pdf/2603.26696)
 
-- `Topo-A*`
-- `Topo-RRT`
-- `Vanilla MPD`
-- `TMPD (Ours)`
-
-The core idea is to augment diffusion-based planning with **global topological memory** (winding-signature based), so each new segment is planned with awareness of previously executed path topology.
+<p align="center">
+  <img src="figures/ani.gif" alt="TMPD denoising and selected trajectory animation" width="720" />
+</p>
 
 ---
+This repository implements `TMPD` (Topological Motion Planning Diffusion), a diffusion-based method for tethered robot path planning in obstacle-rich environments, submitted to IROS 2026.
 
-## 1. What This Project Does
+**NOTES**
 
-Compared to the original MPD release, this repo adds:
+This codebase is developed based on the [mpd-public](https://github.com/joaoamcarvalho/mpd-public/tree/main).
 
-- Dynamic environment variants with obstacle dropout + newly inserted obstacles.
-- Topology utility functions:
-  - trajectory signature (`winding number` style)
-  - topological energy evaluation
-  - taut homotopy reference extraction
-  - safety checks for sphere/box obstacles
-- TMPD inference and benchmarking scripts for fair side-by-side comparison with classic topology-aware planners and vanilla MPD.
-
-Main implementation files:
-
-- `mpd/utils/topology_utils.py`
-- `tmpd_baselines/environment/env_dense_2d_extra_objects.py`
-- `tmpd_baselines/environment/env_simple_2d_extra_objects.py`
-- `scripts/inference/run_astar.py`
-- `scripts/inference/run_rrt.py`
-- `scripts/inference/run_mpd.py`
-- `scripts/inference/run_tmpd.py`
-- `scripts/inference/plot_all_figures.py`
+If you have any questions, please contact: [yifutian@link.cuhk.edu.cn](mailto:yifutian@link.cuhk.edu.cn)
 
 ---
+## Installation
 
-## 2. Environment Setup
+Pre-requisites:
+- Ubuntu 20.04
+- [miniconda](https://docs.conda.io/projects/miniconda/en/latest/index.html)
 
-Recommended:
-
-- Ubuntu 20.04+
-- CUDA GPU (for MPD / TMPD runs)
-- Conda
-
-Clone with submodules:
-
+Clone this repository with:
 ```bash
+cd ~
 git clone --recurse-submodules https://github.com/Yifu-Tian/tmpd-public.git
 cd tmpd-public
 ```
 
-Download and extract Isaac Gym Preview 4 under `deps/isaacgym`:
-
+Download [IsaacGym Preview 4](https://developer.nvidia.com/isaac-gym) and extract it under `deps/isaacgym`:
 ```bash
-mv ~/Downloads/IsaacGym_Preview_4_Package.tar.gz ./deps/
-cd deps
+mv ~/Downloads/IsaacGym_Preview_4_Package.tar.gz ~/tmpd-public/deps/
+cd ~/tmpd-public/deps
 tar -xvf IsaacGym_Preview_4_Package.tar.gz
-cd ..
 ```
 
-Install dependencies:
-
+Run the setup script to install dependencies:
 ```bash
+cd ~/tmpd-public
 bash setup.sh
 ```
 
-`setup.sh` creates the `mpd` conda environment and installs editable local dependencies:
-
-- `deps/experiment_launcher`
-- `deps/torch_robotics`
-- `deps/motion_planning_baselines`
-- `deps/isaacgym/python`
-- `deps/storm`
-- this repository (`pip install -e .`)
-
 ---
+## Running TMPD and baselines
 
-## 3. Prepare Data / Trained Models
-
-The repository intentionally does **not** track heavy artifacts (datasets, checkpoints, benchmark image dumps, pickle logs).
-
-If you want to run inference directly, download the pretrained assets:
+To run TMPD / baseline inference, first download trajectories and trained models.
 
 ```bash
 conda activate mpd
-gdown --id 1mmJAFg6M2I1OozZcyueKp_AP0HHkCq2k
+```
+
+From the repository root:
+```bash
+# `--id` is deprecated in recent gdown, direct URL form is recommended
+gdown "https://drive.google.com/uc?id=1mmJAFg6M2I1OozZcyueKp_AP0HHkCq2k" -O data_trajectories.tar.gz
 tar -xvf data_trajectories.tar.gz
-gdown --id 1I66PJ5QudCqIZ2Xy4P8e-iRBA8-e2zO1
+gdown "https://drive.google.com/uc?id=1I66PJ5QudCqIZ2Xy4P8e-iRBA8-e2zO1" -O data_trained_models.tar.gz
 tar -xvf data_trained_models.tar.gz
 ```
 
-Expected local directories after extraction:
-
+Expected folders after extraction:
 - `data_trajectories/`
 - `data_trained_models/`
 
----
-
-## 4. Run Benchmarks
-
-All commands below are run from:
-
+Run benchmark scripts individually:
 ```bash
-cd scripts/inference
-```
-
-Run each method separately:
-
-```bash
+cd scripts/inference/benchmarks
 python run_astar.py
 python run_rrt.py
 python run_mpd.py
 python run_tmpd.py
 ```
 
-One-click execution (all methods + final comparison plotting):
-
+Run the full benchmark + plotting pipeline:
 ```bash
-bash run_all.sh
+cd scripts/inference
+bash run_benchmark.sh
 ```
 
-Generate 1x4 comparison figures from shared trial data:
-
+Interactive TMPD demo:
 ```bash
-python plot_all_figures.py
+cd scripts/inference
+python inference.py
 ```
+
+Optional plotting (1x4 comparison figures):
+```bash
+cd scripts/inference
+python plotting/plot_all.py
+```
+
+Results are generated under repository-level `results/` by default. Some scripts also support overriding output via `--results_dir`.
+
+Expected model file check (important):
+```bash
+ls data_trained_models/EnvDense2D-RobotPointMass/args.yaml
+ls data_trained_models/EnvSimple2D-RobotPointMass2D/args.yaml
+```
+
+If these files are missing, extraction is incomplete or the directory layout is different from what benchmark scripts expect.
 
 ---
+## Generate data and train from scratch
 
-## 5. Data Generation and Training
+We recommend running the following in a SLURM cluster for large-scale experiments.
 
-Generate training trajectories:
+```bash
+conda activate mpd
+```
 
+To regenerate trajectory data:
 ```bash
 cd scripts/generate_data
 python launch_generate_trajectories.py
 ```
 
-Train diffusion models:
-
+To train diffusion models:
 ```bash
 cd scripts/train_diffusion
 python launch_train_01.py
 ```
 
 ---
-
-## 6. Repository Layout
+## Repository structure
 
 ```text
-mpd/                          # Core MPD modules (datasets, model, trainer, utils)
-tmpd_baselines/               # Dynamic environment variants used by TMPD benchmarks
-scripts/generate_data/        # Trajectory generation pipeline
-scripts/train_diffusion/      # Diffusion model training pipeline
-scripts/inference/            # TMPD + baselines inference/benchmark scripts
-deps/                         # Git submodules (torch_robotics, baselines, etc.)
-figures/                      # Lightweight demo GIFs
+mpd/                          # Core modules (models, trainer, environments, utils)
+mpd/environments/             # Dynamic benchmark environments (extra objects)
+mpd/utils/topology_utils.py   # Topology signature, energy, taut curve, safety checks
+scripts/generate_data/        # Data generation pipeline
+scripts/train_diffusion/      # Diffusion training pipeline
+scripts/inference/inference.py
+scripts/inference/benchmarks/ # run_astar.py / run_rrt.py / run_mpd.py / run_tmpd.py
+scripts/inference/plotting/   # plot_all.py
+scripts/inference/run_benchmark.sh
+results/                      # Benchmark outputs (plots, logs, shared trial data)
 ```
 
 ---
+## Citation
 
-## 7. Notes on Open-Source Snapshot
+If you use our work or code base(s), please cite:
+```latex
+@article{tian2026tmpd,
+  title={Topological Motion Planning Diffusion: Generative Tangle-Free Path Planning for Tethered Robots in Obstacle-Rich Environments},
+  author={Tian, Yifu and Xu, Xinhang and Nguyen, Thien-Minh and Cao, Muqing},
+  journal={arXiv preprint arXiv:2603.26696},
+  year={2026},
+  note={Submitted to IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  url={https://arxiv.org/pdf/2603.26696}
+}
+```
 
-- Large local files and generated benchmark outputs are excluded from Git.
-- This keeps the repo lightweight and reproducible as source code.
-- If you need exact experiment outputs, regenerate them from scripts in `scripts/inference/`.
-
----
-
-## 8. Citation
-
-If you use the original MPD method, please cite:
-
-```bibtex
+If you also build on MPD, please additionally cite:
+```latex
 @inproceedings{carvalho2023mpd,
   title={Motion Planning Diffusion: Learning and Planning of Robot Motions with Diffusion Models},
   author={Carvalho, J. and Le, A.T. and Baierl, M. and Koert, D. and Peters, J.},
@@ -183,13 +164,3 @@ If you use the original MPD method, please cite:
   year={2023}
 }
 ```
-
----
-
-## 9. Acknowledgements
-
-- Original MPD repository and paper:
-  - https://github.com/jacarvalho/mpd-public
-  - https://arxiv.org/abs/2308.01557
-- Diffuser:
-  - https://github.com/jannerm/diffuser

@@ -5,47 +5,41 @@ import pandas as pd
 import torch
 import math
 import matplotlib
-matplotlib.use('Agg') # 开启 Headless 极速画图模式
-import matplotlib.pyplot as plt
+matplotlib.use('Agg')  # Headless plotting backend.
 
-# 导入底层依赖 (移除了 MPD 模型相关依赖，大幅提升启动速度)
+# Core dependencies (no MPD model runtime).
 from experiment_launcher import single_experiment_yaml, run_experiment
 from mpd.trainer import get_dataset
+from mpd.utils.bench_plotting import render_segmented_trial_plot
 from mpd.utils.loading import load_params_from_yaml
+from mpd.utils.bench_io import ensure_dir, resolve_output_root
+from mpd.utils.bench_metrics import format_time_to_success_summary
+from mpd.utils.waypoints import generate_sequential_waypoints, resample_trajectory
 from torch_robotics.torch_utils.seed import fix_random_seed
 from torch_robotics.torch_utils.torch_utils import get_torch_device
 from torch_robotics.trajectory.metrics import compute_smoothness
 
-# 导入动态密林环境与拓扑工具
-from tmpd_baselines.environment.env_dense_2d_extra_objects import EnvDense2DExtraObjects
+# Dynamic environment and topology utilities.
+from mpd.environments.env_dense_2d_extra_objects import EnvDense2DExtraObjects
 from mpd.utils.topology_utils import (
+    calc_delta_winding_vectorized,
     get_trajectory_signature,
     get_simplest_homotopy_curve,
-    is_trajectory_safe
 )
 
-TRAINED_MODELS_DIR = '../../data_trained_models/'
-RESULTS_DIR = 'benchmark_time_to_success_rrt'
-PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots') # 【新增】单独的图片保存文件夹
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INFERENCE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(INFERENCE_DIR, "..", ".."))
+RESULTS_ROOT = os.path.join(PROJECT_ROOT, "results")
+TRAINED_MODELS_DIR = os.path.join(PROJECT_ROOT, "data_trained_models")
+RESULTS_DIR = os.path.join(RESULTS_ROOT, "benchmark_time_to_success_rrt")
 
-# ==========================================
-# 共享组件：RRT 节点与绕数计算
-# ==========================================
+# RRT node and winding helpers.
 class RRTNode:
     def __init__(self, x, y, W_array, parent=None):
         self.x = x; self.y = y; self.W_array = W_array; self.parent = parent
 
-def calc_delta_winding_vectorized(p1, p2, obstacles):
-    if len(obstacles) == 0: return np.array([])
-    p1, p2 = np.array(p1), np.array(p2)
-    v1, v2 = p1 - obstacles, p2 - obstacles
-    theta1, theta2 = np.arctan2(v1[:, 1], v1[:, 0]), np.arctan2(v2[:, 1], v2[:, 0])
-    delta_theta = (theta2 - theta1 + np.pi) % (2 * np.pi) - np.pi
-    return delta_theta / (2 * np.pi)
-
-# ==========================================
-# 算法核心：Topo-RRT
-# ==========================================
+# Topo-RRT search.
 def lifelong_topo_rrt(start, goal, env, initial_W, step_size=0.05, W_th=0.95, robot_radius=0.05, max_iters=50000):
     obs_centers = getattr(env, 'active_obs_centers', [])
     obs_types = getattr(env, 'active_obs_types', [])
@@ -91,62 +85,30 @@ def lifelong_topo_rrt(start, goal, env, initial_W, step_size=0.05, W_th=0.95, ro
             return path[::-1]
     return None
 
-def resample_trajectory(traj_np, n_points):
-    if len(traj_np) == n_points: return traj_np
-    if len(traj_np) < 2: return np.zeros((n_points, traj_np.shape[1]))
-    diffs = np.linalg.norm(np.diff(traj_np, axis=0), axis=1)
-    cum_dists = np.insert(np.cumsum(diffs), 0, 0)
-    if cum_dists[-1] == 0: return np.tile(traj_np[0], (n_points, 1))
-    resampled = np.zeros((n_points, traj_np.shape[1]))
-    for i in range(traj_np.shape[1]): resampled[:, i] = np.interp(np.linspace(0, cum_dists[-1], n_points), cum_dists, traj_np[:, i])
-    return resampled
-
-def generate_sequential_waypoints(env, task, q_dim, tensor_args, num_segments=5, max_attempts=1000):
-    obs_centers_np = getattr(env, 'active_obs_centers', [])
-    obs_types = getattr(env, 'active_obs_types', ['sphere'] * len(obs_centers_np))
-    obs_dims = getattr(env, 'active_obs_dims', [np.array([0.125])] * len(obs_centers_np))
-    waypoints_np, waypoints_t = [], []
-    while True:
-        p0 = np.random.uniform(-0.85, 0.85, size=q_dim)
-        t0 = torch.tensor(p0, **tensor_args)
-        if task.compute_collision(t0.unsqueeze(0)).item() == 0:
-            waypoints_np.append(p0); waypoints_t.append(t0); break
-    for _ in range(num_segments):
-        curr_p = waypoints_np[-1]
-        found = False
-        for _ in range(max_attempts):
-            next_p = np.random.uniform(-0.85, 0.85, size=q_dim)
-            next_t = torch.tensor(next_p, **tensor_args)
-            if task.compute_collision(next_t.unsqueeze(0)).item() > 0 or np.linalg.norm(next_p - curr_p) < 0.6: continue
-            if not is_trajectory_safe(np.array([curr_p, next_p]), obs_centers_np, obs_types, obs_dims):
-                waypoints_np.append(next_p); waypoints_t.append(next_t); found = True; break
-        if not found: return None, None
-    return waypoints_t, waypoints_np
-
-# ==========================================
-# 评测主流程 (专注 Topo-RRT)
-# ==========================================
+# Benchmark entrypoint.
 @single_experiment_yaml
 def run_benchmark_topo_rrt(
     model_id: str = 'EnvDense2D-RobotPointMass',
     num_trials: int = 100,
     num_segments: int = 5,
-    device: str = 'cpu',  # RRT 主要吃 CPU，这里设为 CPU 即可
+    device: str = 'cpu',  # RRT runs on CPU.
     seed: int = 42,
     results_dir: str = 'logs',
     **kwargs
 ):
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR, exist_ok=True) # 创建专属图片文件夹
+    benchmark_results_dir = resolve_output_root(RESULTS_DIR, results_dir)
+    plots_dir = os.path.join(benchmark_results_dir, 'plots')
+    ensure_dir(benchmark_results_dir)
+    ensure_dir(plots_dir)
     
     fix_random_seed(seed)
     device = get_torch_device(device)
     tensor_args = {'device': device, 'dtype': torch.float32}
 
-    print(f'🚀 Initializing "Time-to-Success" Benchmark (Topo-RRT ONLY - Visualizer Enabled)...')
-    print(f'📁 Plots will be saved to: {PLOTS_DIR}')
+    print('Initializing "Time-to-Success" Benchmark (Topo-RRT ONLY - Visualizer Enabled)...')
+    print(f'Plots will be saved to: {plots_dir}')
     
-    # 仅加载环境和 Task 供几何碰撞与验证使用，不加载 MPD 模型！
+    # Load env/task data for geometric checks only.
     model_dir = os.path.join(TRAINED_MODELS_DIR, model_id)
     args = load_params_from_yaml(os.path.join(model_dir, "args.yaml"))
     train_subset, _, _, _ = get_dataset(dataset_class='TrajectoryDataset', use_extra_objects=True, obstacle_cutoff_margin=0.05, **args, tensor_args=tensor_args)
@@ -156,7 +118,7 @@ def run_benchmark_topo_rrt(
     all_results = []
 
     for trial in range(num_trials):
-        dynamic_env = EnvDense2DExtraObjects(tensor_args=tensor_args, drop_old_num=2, num_extra_spheres=12, num_extra_boxes=12, seed=42+trial) # 加了 trial 确保每次环境不同
+        dynamic_env = EnvDense2DExtraObjects(tensor_args=tensor_args, drop_old_num=2, num_extra_spheres=12, num_extra_boxes=12, seed=42+trial)  # Vary map per trial.
         dynamic_task = type(base_task)(env=dynamic_env, robot=robot, tensor_args=tensor_args, obstacle_cutoff_margin=0.05)
         obs_centers_np = getattr(dynamic_env, 'active_obs_centers', [])
         obs_types = getattr(dynamic_env, 'active_obs_types', [])
@@ -167,7 +129,7 @@ def run_benchmark_topo_rrt(
 
         print(f"\n================ [ Trial {trial+1}/{num_trials} ] ================")
         
-        # 重置 tracker 状态，新增 final_energy
+        # Per-trial tracker.
         tracker = {"history": [], "sr": 0, "time": 0.0, "fatal_error": False, "tangled": False, "pl_list": [], "sm_list": [], "final_energy": 0.0}
 
         for seg in range(num_segments):
@@ -190,7 +152,7 @@ def run_benchmark_topo_rrt(
             max_rrt_attempts = 20
             while best_traj_np is None and attempts < max_rrt_attempts:
                 attempts += 1
-                # 严格对齐 0.05 机器人半径
+                # Keep collision model aligned with planner settings.
                 path_list = lifelong_topo_rrt(start_np, goal_np, dynamic_env, initial_W, step_size=0.05, robot_radius=0.05, max_iters=50000)
                 if path_list: 
                     best_traj_np = resample_trajectory(np.array(path_list), n_support_points)
@@ -198,7 +160,7 @@ def run_benchmark_topo_rrt(
                     print(f"    [Topo-RRT] Segment {seg+1}: Tree maxed out. Restarting (Attempt {attempts}/{max_rrt_attempts})...")
             
             if best_traj_np is None:
-                print(f"    [Topo-RRT] ⚠️ FATAL: Trapped in topological deadlock after {max_rrt_attempts} attempts.")
+                print(f"    [Topo-RRT] FATAL: Trapped in topological deadlock after {max_rrt_attempts} attempts.")
                 tracker["fatal_error"] = True
 
             seg_time = time.time() - t0
@@ -210,24 +172,22 @@ def run_benchmark_topo_rrt(
                 tracker["pl_list"].append(np.sum(np.linalg.norm(np.diff(best_traj_np, axis=0), axis=1)))
                 tracker["sm_list"].append(compute_smoothness(torch.tensor(best_traj_np, **tensor_args).unsqueeze(0), robot).item())
                 
-                # 计算全生命周期的拓扑能量
+                # Evaluate full-path topology energy.
                 full_path = np.concatenate(tracker["history"])
                 taut = get_simplest_homotopy_curve(full_path, obs_centers_np, obs_types, obs_dims)
                 check_traj = taut if taut is not None else full_path
                 
                 sig = get_trajectory_signature(check_traj, obs_centers_np)
-                tracker["final_energy"] = np.sum(np.abs(sig))  # 记录能量
+                tracker["final_energy"] = np.sum(np.abs(sig))
                 
                 if np.any(np.abs(sig) >= 0.98):
                     tracker["tangled"] = True
 
-        # ==========================
-        # 【画图逻辑修改】：生成蓝绿渐变色轨迹图 (带精细箭头)
-        # ==========================
-        fig, ax = plt.subplots(figsize=(10, 10))
-        dynamic_env.render(ax)
-        ax.set_xlim(-1, 1); ax.set_ylim(-1, 1); ax.set_aspect('equal')
-        
+        taut_traj = None
+        if len(tracker["history"]) > 0:
+            full_hist = np.concatenate(tracker["history"])
+            taut_traj = get_simplest_homotopy_curve(full_hist, obs_centers_np, obs_types, obs_dims)
+
         if tracker["fatal_error"]:
             title_color = 'red'
             status_txt = f"Deadlock at Seg {tracker['sr']+1}"
@@ -237,63 +197,26 @@ def run_benchmark_topo_rrt(
         else:
             title_color = 'green'
             status_txt = f"Success (Energy: {tracker['final_energy']:.2f})"
-            
-        ax.set_title(f"Topo-RRT - Trial {trial+1} [{status_txt}]", fontsize=16, weight='bold', color=title_color)
 
-        # 1. 生成 从蓝到绿 的高级渐变色卡
-        cmap = plt.cm.winter
-        segment_colors = cmap(np.linspace(0.0, 1.0, max(1, len(waypoints_np)-1)))
+        failed_wp = waypoints_np[tracker["sr"] + 1] if tracker["fatal_error"] else None
+        render_segmented_trial_plot(
+            env=dynamic_env,
+            waypoints_np=waypoints_np,
+            history_trajs=tracker["history"],
+            trial_idx=trial + 1,
+            method_label="Topo-RRT",
+            status_txt=status_txt,
+            title_color=title_color,
+            output_path=os.path.join(plots_dir, f"topo_rrt_trial_{trial+1:03d}.png"),
+            taut_traj=taut_traj,
+            is_tangled=tracker["tangled"],
+            failed_goal=failed_wp,
+            failed_goal_label="Unreachable Goal",
+            failed_traj=None,
+            dpi=150,
+        )
 
-        # 2. 画航点
-        for k, wp in enumerate(waypoints_np):
-            if k == 0:
-                ax.plot(wp[0], wp[1], 's', color='green', markersize=12, markeredgecolor='black', zorder=20)
-                ax.text(wp[0], wp[1]-0.08, 'S', color='green', ha='center', va='top', weight='bold', zorder=21)
-            else:
-                ax.plot(wp[0], wp[1], 'o', color='gold', markersize=12, markeredgecolor='black', zorder=20)
-                ax.text(wp[0], wp[1], str(k), color='black', ha='center', va='center', weight='bold', zorder=21)
-
-        # 3. 画出渐变色实线轨迹 + 瘦长精细方向箭头
-        for seg_idx, traj in enumerate(tracker["history"]):
-            if len(traj) < 2: continue
-            
-            c = segment_colors[seg_idx]
-            # 主轨迹
-            ax.plot(traj[:, 0], traj[:, 1], color=c, linewidth=3.5, alpha=0.85, label=f'Seg {seg_idx+1}')
-            
-            # 画箭头指示方向 (加在中间偏后的位置，使用调整后的参数)
-            mid = int(len(traj) * 0.6)
-            if len(traj) > 2:
-                dx, dy = traj[mid+1, 0] - traj[mid, 0], traj[mid+1, 1] - traj[mid, 1]
-                norm = math.hypot(dx, dy)
-                if norm > 0:
-                    ax.arrow(traj[mid, 0], traj[mid, 1], dx/norm*0.001, dy/norm*0.001, 
-                             shape='full', lw=0, length_includes_head=True, 
-                             head_width=0.02, head_length=0.03, color=c, zorder=25)
-
-        # 4. 标出导致死锁的目标点 (用红叉高亮)
-        if tracker["fatal_error"]:
-            failed_wp = waypoints_np[tracker["sr"] + 1]
-            ax.plot(failed_wp[0], failed_wp[1], 'rx', markersize=20, markeredgewidth=4, zorder=25, label='Unreachable Goal')
-
-        # 5. 画出全局拉紧后的同伦曲线 (虚线)
-        if len(tracker["history"]) > 0:
-            full_hist = np.concatenate(tracker["history"])
-            taut_traj = get_simplest_homotopy_curve(full_hist, obs_centers_np, obs_types, obs_dims)
-            if taut_traj is not None:
-                if tracker["tangled"]:
-                    ax.plot(taut_traj[:, 0], taut_traj[:, 1], color='red', linewidth=3.5, linestyle='--', alpha=0.9, zorder=15, label='Tangled Taut Curve')
-                else:
-                    ax.plot(taut_traj[:, 0], taut_traj[:, 1], color='darkorange', linewidth=2.5, linestyle=':', alpha=0.6, zorder=15, label='Safe Taut Curve')
-
-        # handles, labels = ax.get_legend_handles_labels()
-        # if handles: ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(PLOTS_DIR, f"topo_rrt_trial_{trial+1:03d}.png"), dpi=150)
-        plt.close(fig)
-
-        # 记录指标
+        # Log metrics.
         is_fully_successful = (not tracker["tangled"]) and (not tracker["fatal_error"]) and (tracker["sr"] == num_segments)
         attempted_segs = tracker["sr"] + (1 if tracker["fatal_error"] else 0)
         
@@ -307,21 +230,12 @@ def run_benchmark_topo_rrt(
             "Final_Topo_Energy": tracker["final_energy"] if is_fully_successful else np.nan
         })
 
-    # ==========================
-    # 统计汇总
-    # ==========================
+    # Summarize metrics.
     df = pd.DataFrame(all_results)
-    summary = df.groupby("Method").agg({
-        "Success_Rate": lambda x: f"{np.mean(x)*100:.1f}%",
-        "Tangle_Free_Rate": lambda x: f"{np.mean(x)*100:.1f}%",
-        "Avg_Seg_Time": lambda x: f"{np.nanmean(x):.2f}s ± {np.nanstd(x):.2f}",
-        "Path_Length": lambda x: f"{np.nanmean(x):.3f} ± {np.nanstd(x):.2f}",
-        "Smoothness": lambda x: f"{np.nanmean(x)*1000:.3f} ± {np.nanstd(x)*1000:.3f}",
-        "Final_Topo_Energy": lambda x: f"{np.nanmean(x):.2f} ± {np.nanstd(x):.2f}"
-    })
+    summary = format_time_to_success_summary(df, include_final_topo_energy=True)
     
     print("\n" + "="*85)
-    print("🏆 TOPO-RRT REPORT")
+    print("TOPO-RRT REPORT")
     print("="*95)
     print(summary.to_string())
     print("="*95)

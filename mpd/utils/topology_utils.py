@@ -1,10 +1,27 @@
 import numpy as np
 
+
+def calc_delta_winding_vectorized(p1, p2, obstacles):
+    """Compute winding increment from segment p1->p2 around each obstacle."""
+    if len(obstacles) == 0:
+        return np.array([])
+
+    p1 = np.asarray(p1)
+    p2 = np.asarray(p2)
+    obs = np.asarray(obstacles)
+
+    v1, v2 = p1 - obs, p2 - obs
+    theta1 = np.arctan2(v1[:, 1], v1[:, 0])
+    theta2 = np.arctan2(v2[:, 1], v2[:, 0])
+    delta_theta = (theta2 - theta1 + np.pi) % (2 * np.pi) - np.pi
+    return delta_theta / (2 * np.pi)
+
+
 def get_trajectory_signature(traj_np, obs_centers):
-    """ 计算单条轨迹绕所有障碍物的包角签名向量 (Winding Number Vector) """
+    """Compute per-obstacle winding signature for a trajectory."""
     if len(traj_np) < 2 or len(obs_centers) == 0:
         return np.zeros(len(obs_centers))
-    
+
     sig = []
     for cx, cy in obs_centers:
         vecs = traj_np - np.array([cx, cy])
@@ -14,8 +31,9 @@ def get_trajectory_signature(traj_np, obs_centers):
         sig.append(w)
     return np.array(sig)
 
+
 def is_trajectory_safe(traj_np, obs_centers, obs_types, obs_dims, margin=0.005):
-    """ 绝对数学几何防穿墙过滤器 (分别精确处理圆形和方形) """
+    """Return True if each segment stays outside all obstacles."""
     if len(traj_np) < 2 or len(obs_centers) == 0:
         return True
 
@@ -23,12 +41,12 @@ def is_trajectory_safe(traj_np, obs_centers, obs_types, obs_dims, margin=0.005):
         p1, p2 = traj_np[i], traj_np[i+1]
         l2 = np.sum((p1 - p2)**2)
         dist_p1_p2 = np.sqrt(l2)
-        
-        # 对方形障碍物进行密集的线段采样检测 (简单且极度鲁棒)
+
+        # Dense segment sampling keeps box checks robust and simple.
         num_pts = max(3, int(dist_p1_p2 / 0.01)) 
         xs = np.linspace(p1[0], p2[0], num_pts)
         ys = np.linspace(p1[1], p2[1], num_pts)
-        
+
         for center, o_type, dims in zip(obs_centers, obs_types, obs_dims):
             if o_type == 'sphere':
                 hard_rad = dims[0]
@@ -40,25 +58,25 @@ def is_trajectory_safe(traj_np, obs_centers, obs_types, obs_dims, margin=0.005):
                     dist = np.linalg.norm(center - projection)
                 if dist < hard_rad - margin:
                     return False
-                    
+
             elif o_type == 'box':
-                # 【修复核心】：使用 AABB 检测，而不是变态的外接圆
                 half_w, half_h = dims[0], dims[1]
-                # 减去 margin 是为了容忍极微小的边界擦碰
                 min_x, max_x = center[0] - half_w + margin, center[0] + half_w - margin
                 min_y, max_y = center[1] - half_h + margin, center[1] + half_h - margin
-                
+
                 in_x = (xs > min_x) & (xs < max_x)
                 in_y = (ys > min_y) & (ys < max_y)
                 if np.any(in_x & in_y):
                     return False
     return True
 
+
 def prune_self_intersections(traj_np, spatial_thresh=0.06, temporal_thresh=8):
-    """ 时空打结消除器 """
+    """Prune long-range temporal loops and optionally resample."""
     n_pts = len(traj_np)
-    if n_pts < temporal_thresh: return traj_np
-    
+    if n_pts < temporal_thresh:
+        return traj_np
+
     keep_indices = []
     curr_idx = 0
     while curr_idx < n_pts:
@@ -70,9 +88,9 @@ def prune_self_intersections(traj_np, spatial_thresh=0.06, temporal_thresh=8):
                 jump_idx = j
                 break
         curr_idx = jump_idx
-    
+
     pruned_traj = traj_np[keep_indices]
-    
+
     if len(pruned_traj) < n_pts and len(pruned_traj) > 1:
         diffs = np.linalg.norm(np.diff(pruned_traj, axis=0), axis=1)
         cum_dists = np.insert(np.cumsum(diffs), 0, 0)
@@ -85,14 +103,15 @@ def prune_self_intersections(traj_np, spatial_thresh=0.06, temporal_thresh=8):
             return resampled
     return pruned_traj
 
+
 def get_simplest_homotopy_curve(raw_hist_np, obs_centers, obs_types, obs_dims):
-    """ 最简拓扑同伦保形器 (Taut-String + Elastic Skin) """
+    """Compute a simplified homotopy-preserving reference path."""
     if len(raw_hist_np) < 3 or len(obs_centers) == 0:
         return raw_hist_np
 
     def is_homotopic_segment(path_segment, p1, p2):
-        # 【修复核心】：完美闭合！原代码的写法会在尾部画一个死结 8 字形
-        loop = np.vstack([path_segment, p1]) 
+        # Close the loop before winding evaluation.
+        loop = np.vstack([path_segment, p1])
         sig = get_trajectory_signature(loop, obs_centers)
         return np.all(np.abs(sig) < 0.1)
 
@@ -115,8 +134,9 @@ def get_simplest_homotopy_curve(raw_hist_np, obs_centers, obs_types, obs_dims):
     diffs = np.linalg.norm(np.diff(skeleton_np, axis=0), axis=1)
     cum_dist = np.insert(np.cumsum(diffs), 0, 0)
     total_len = cum_dist[-1]
-    
-    if total_len < 1e-3: return raw_hist_np
+
+    if total_len < 1e-3:
+        return raw_hist_np
 
     new_dists = np.arange(0, total_len, 0.02)
     x_res = np.interp(new_dists, cum_dist, skeleton_np[:, 0])
@@ -134,7 +154,7 @@ def get_simplest_homotopy_curve(raw_hist_np, obs_centers, obs_types, obs_dims):
         path = smoothed
 
         for center, o_type, dims in zip(obs_centers, obs_types, obs_dims):
-            # 【修复核心】：不再使用巨大的 hypot 来推离 Box，使用 max 避免过度膨胀
+            # Use a conservative soft radius for obstacle repulsion.
             soft_rad = (dims[0] if o_type == 'sphere' else max(dims[0], dims[1])) + 0.035
             vecs = path - center
             dists = np.linalg.norm(vecs, axis=1)
@@ -146,33 +166,32 @@ def get_simplest_homotopy_curve(raw_hist_np, obs_centers, obs_types, obs_dims):
                 push_dirs = vecs[in_obs] / dists_safe[in_obs, np.newaxis]
                 path[in_obs] = center + push_dirs * soft_rad
 
-    # 【修复核心】：无论最终平滑后的轨迹是否在边界上擦碰了障碍物，
-    # 都把它当作拓扑基准返回！因为它的拓扑意义比 Raw History 干净一万倍。
     return path
 
+
 def evaluate_homotopy_topological_energy(history_traj_np, homotopy_classes, obs_centers, w_max=0.8):
-    """ 拓扑能量评估引擎 """
+    """Score homotopy candidates by winding-based barrier energy."""
     if len(obs_centers) == 0 or len(homotopy_classes) == 0:
         return [0.0] * len(homotopy_classes), []
 
     w_hist = get_trajectory_signature(history_traj_np, obs_centers) if len(history_traj_np) > 1 else np.zeros(len(obs_centers))
-    
+
     energies, w_totals_list = [], []
     for traj in homotopy_classes:
         w_cand = get_trajectory_signature(traj, obs_centers)
         w_total = w_hist + w_cand
         w_totals_list.append(w_total)
-        
+
         ratio = np.abs(w_total) / w_max
         energy_k = np.zeros_like(ratio)
-        
+
         margin = 0.95
         safe_mask = ratio < margin
         danger_mask = ~safe_mask
-        
+
         energy_k[safe_mask] = -np.log(1.0 - ratio[safe_mask]**2 + 1e-8)
         energy_k[danger_mask] = -np.log(1.0 - margin**2) + ((2 * margin) / (1.0 - margin**2)) * (ratio[danger_mask] - margin)
-        
+
         energies.append(np.sum(energy_k))
-        
+
     return energies, w_totals_list

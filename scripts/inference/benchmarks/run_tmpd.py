@@ -1,63 +1,45 @@
 import os
 import time
-import pickle
 from math import ceil
-from pathlib import Path
 import numpy as np
 import pandas as pd
-import einops
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import torch
 import math
-from matplotlib.widgets import CheckButtons
 
 from experiment_launcher import single_experiment_yaml, run_experiment
 from mp_baselines.planners.costs.cost_functions import CostCollision, CostComposite, CostGPTrajectory
 from mpd.models import TemporalUnet, UNET_DIM_MULTS
 from mpd.models.diffusion_models.guides import GuideManagerTrajectoriesWithVelocity
-from mpd.models.diffusion_models.sample_functions import guide_gradient_steps, ddpm_sample_fn
+from mpd.models.diffusion_models.sample_functions import ddpm_sample_fn
 from mpd.trainer import get_dataset, get_model
+from mpd.utils.bench_io import ensure_dir, resolve_output_root
+from mpd.utils.bench_metrics import format_time_to_success_summary
 from mpd.utils.loading import load_params_from_yaml
+from mpd.utils.waypoints import generate_sequential_waypoints
 from torch_robotics.torch_utils.seed import fix_random_seed
 from torch_robotics.torch_utils.torch_timer import TimerCUDA
 from torch_robotics.torch_utils.torch_utils import get_torch_device, freeze_torch_model_params
-from torch_robotics.trajectory.metrics import compute_smoothness, compute_path_length, compute_variance_waypoints
+from torch_robotics.trajectory.metrics import compute_smoothness
 
-from tmpd_baselines.environment.env_dense_2d_extra_objects import EnvDense2DExtraObjects
+from mpd.environments.env_dense_2d_extra_objects import EnvDense2DExtraObjects
 
 from mpd.utils.topology_utils import (
     get_trajectory_signature,
     prune_self_intersections,
     get_simplest_homotopy_curve,
     evaluate_homotopy_topological_energy,
-    is_trajectory_safe
 )
 
-TRAINED_MODELS_DIR = '../../data_trained_models/'
-def apply_laplacian_smoothing(traj, iters=5):
-    """
-    在不改变轨迹拓扑和起终点的情况下，消除高频抖动。
-    iters=5 是一个非常安全的保守值，能在大幅降低 Smoothness Cost 的同时防止轨迹“切角”撞墙。
-    """
-    if len(traj) < 3: return traj
-    smoothed = np.copy(traj)
-    for _ in range(iters):
-        # 核心公式: 当前点 = 自身占50% + 左右邻居各占25% (起终点绝对不动)
-        smoothed[1:-1] = 0.5 * smoothed[1:-1] + 0.25 * smoothed[:-2] + 0.25 * smoothed[2:]
-    return smoothed
-def resample_trajectory(traj_np, n_points):
-    if len(traj_np) == n_points: return traj_np
-    if len(traj_np) < 2: return np.zeros((n_points, traj_np.shape[1]))
-    diffs = np.linalg.norm(np.diff(traj_np, axis=0), axis=1)
-    cum_dists = np.insert(np.cumsum(diffs), 0, 0)
-    if cum_dists[-1] == 0: return np.tile(traj_np[0], (n_points, 1))
-    resampled = np.zeros((n_points, traj_np.shape[1]))
-    for i in range(traj_np.shape[1]): 
-        resampled[:, i] = np.interp(np.linspace(0, cum_dists[-1], n_points), cum_dists, traj_np[:, i])
-    return resampled
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INFERENCE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(INFERENCE_DIR, "..", ".."))
+RESULTS_ROOT = os.path.join(PROJECT_ROOT, "results")
+TRAINED_MODELS_DIR = os.path.join(PROJECT_ROOT, "data_trained_models")
+RESULTS_DIR = os.path.join(RESULTS_ROOT, "benchmark_time_to_success_tmpd")
+
 def render_demo(
     fig, ax, iteration_count, env, history_path_list, 
     latest_all_trajs, latest_best_traj, current_start_pos,
@@ -77,7 +59,6 @@ def render_demo(
     ax.set_ylim(-1.1, 1.1)
     ax.set_aspect('equal')
     ax.set_title(f"Trial {trial_idx} - Segment {iteration_count}: Auto Planning...", fontsize=13, fontweight='bold')
-    # ax.grid(False, linestyle='--', alpha=0.5)
 
     if current_lines is not None:
         for k in current_lines.keys():
@@ -88,9 +69,7 @@ def render_demo(
     obs_centers_np = getattr(env, 'active_obs_centers', [])
     for k, center in enumerate(obs_centers_np):
         ax.text(center[0], center[1], f"O{k+1}", color='white', ha='center', va='center', weight='bold', fontsize=9, zorder=10)
-    # ==========================================
-    # 【新增逻辑】：渲染全局规划航点 (Waypoints)
-    # ==========================================
+    # Draw planned waypoints.
     if waypoints_np is not None:
         for k, wp in enumerate(waypoints_np):
             if k == 0:
@@ -101,7 +80,7 @@ def render_demo(
                 ax.text(wp[0], wp[1], str(k), color='black', ha='center', va='center', weight='bold', zorder=21)
 
     if len(history_path_list) > 0:
-        # 使用 winter 色卡 (蓝 -> 绿)
+        # Use a blue-to-green colormap for segment order.
         cmap = plt.cm.winter
         segment_colors = cmap(np.linspace(0.0, 1.0, max(1, len(history_path_list))))
         
@@ -109,11 +88,10 @@ def render_demo(
             if len(traj) < 2: continue
             c = segment_colors[seg_idx]
             
-            # 画单段实线
             lines = ax.plot(traj[:, 0], traj[:, 1], color=c, linestyle='-', linewidth=2.5, alpha=0.9, label='Raw History' if seg_idx==0 else "", visible=VIS_STATE['Raw History'])
             current_lines['Raw History'].extend(lines)
             
-            # 加上精细箭头 (60%位置)
+            # Draw direction arrow near 60% of each segment.
             if VIS_STATE['Raw History']:
                 mid = int(len(traj) * 0.6)
                 if len(traj) > 2:
@@ -124,13 +102,11 @@ def render_demo(
                                  shape='full', lw=0, length_includes_head=True, 
                                  head_width=0.02, head_length=0.03, color=c, zorder=25)
 
-        # 起点标识
+        # Draw start and reached waypoints when global waypoints are hidden.
         if waypoints_np is None:
-            # 起点标识
             initial_pt = history_path_list[0][0]
             ax.plot(initial_pt[0], initial_pt[1], 'bs', markersize=8, markeredgecolor='white', zorder=12)
             
-            # 途经航点标识
             reached_pts = np.array([t[-1] for t in history_path_list])
             ax.plot(reached_pts[:, 0], reached_pts[:, 1], 'bo', markersize=6, markeredgecolor='white', zorder=12)
     if latest_optimized_traj is not None:
@@ -139,21 +115,6 @@ def render_demo(
                         solid_capstyle='round', label='Global Taut Cable', 
                         visible=VIS_STATE['Global H1'])
         current_lines['Global H1'].extend(lines)
-
-    # if latest_best_traj is not None:
-        # lines = ax.plot(latest_best_traj[:, 0], latest_best_traj[:, 1], 
-        #                 color='darkred', linewidth=2.5, label='MPD Candidate', 
-        #                 visible=VIS_STATE['MPD Candidate'])
-        # current_lines['MPD Candidate'].extend(lines)
-        
-        # if latest_best_energy is not None:
-        #     mid_idx = len(latest_best_traj) // 2
-        #     label_text = f"MPD_Best (E:{latest_best_energy:.1f})"
-            # txt = ax.text(latest_best_traj[mid_idx, 0], latest_best_traj[mid_idx, 1], label_text, 
-            #               color='fuchsia', weight='bold', fontsize=10, 
-            #               bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'), 
-            #               zorder=30, visible=VIS_STATE['MPD Candidate'])
-            # current_lines['MPD Candidate'].append(txt)
 
     if latest_all_trajs is not None:
         for i in range(len(latest_all_trajs)):
@@ -186,46 +147,17 @@ def render_demo(
     
     if target_pos is not None:
         ax.plot(target_pos[0], target_pos[1], 'rx', markersize=12, markeredgewidth=3, zorder=35, label='Target Pos')
-    
-    # handles, labels = ax.get_legend_handles_labels()
-    # by_label = dict(zip(labels, handles))
-    # if handles:
-    #     ax.legend(by_label.values(), by_label.keys(), loc='upper right', framealpha=0.9)
-    
+        
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
-
-def generate_sequential_waypoints(env, task, q_dim, tensor_args, num_segments=5, max_attempts=1000):
-    obs_centers_np = getattr(env, 'active_obs_centers', [])
-    obs_types = getattr(env, 'active_obs_types', ['sphere'] * len(obs_centers_np))
-    obs_dims = getattr(env, 'active_obs_dims', [np.array([0.125])] * len(obs_centers_np))
-    waypoints_np, waypoints_t = [], []
-    
-    while True:
-        p0 = np.random.uniform(-0.85, 0.85, size=q_dim)
-        t0 = torch.tensor(p0, **tensor_args)
-        if task.compute_collision(t0.unsqueeze(0)).item() == 0:
-            waypoints_np.append(p0); waypoints_t.append(t0); break
-            
-    for _ in range(num_segments):
-        curr_p = waypoints_np[-1]
-        found = False
-        for _ in range(max_attempts):
-            next_p = np.random.uniform(-0.85, 0.85, size=q_dim)
-            next_t = torch.tensor(next_p, **tensor_args)
-            if task.compute_collision(next_t.unsqueeze(0)).item() > 0 or np.linalg.norm(next_p - curr_p) < 0.6: continue
-            if not is_trajectory_safe(np.array([curr_p, next_p]), obs_centers_np, obs_types, obs_dims):
-                waypoints_np.append(next_p); waypoints_t.append(next_t); found = True; break
-        if not found: return None, None
-    return waypoints_t, waypoints_np
 
 @single_experiment_yaml
 def experiment(
     model_id: str = 'EnvDense2D-RobotPointMass',
     planner_alg: str = 'tmpd',
     use_guide_on_extra_objects_only: bool = False,
-    n_samples: int = 70,  #
-    start_guide_steps_fraction: float = 0.1, #0.25
+    n_samples: int = 70,
+    start_guide_steps_fraction: float = 0.1,
     n_guide_steps: int = 10,
     n_diffusion_steps_without_noise: int = 10, 
     weight_grad_cost_collision: float = 1e-2,
@@ -237,7 +169,7 @@ def experiment(
     render: bool = False, 
     seed: int = 42,
     results_dir: str = 'logs',
-    # 新增批量参数，但不改变你原有的参数默认值
+    # Batch benchmark settings.
     num_trials: int = 100,
     num_segments: int = 5,
     **kwargs
@@ -246,13 +178,14 @@ def experiment(
     device = get_torch_device(device)
     tensor_args = {'device': device, 'dtype': torch.float32}
 
-    print(f'##########################################################################################################')
+    print('##########################################################################################################')
     print(f'Model -- {model_id} | Algorithm -- {planner_alg}')
     print(f'Running Benchmark: {num_trials} Trials x {num_segments} Segments')
     
     model_dir = os.path.join(TRAINED_MODELS_DIR, model_id)
-    results_dir = os.path.join(model_dir, 'results_inference', f'benchmark_seed_{seed}')
-    os.makedirs(results_dir, exist_ok=True)
+    benchmark_results_root = resolve_output_root(RESULTS_DIR, results_dir)
+    results_dir = os.path.join(benchmark_results_root, f'benchmark_seed_{seed}')
+    ensure_dir(results_dir)
     args = load_params_from_yaml(os.path.join(model_dir, "args.yaml"))
 
     train_subset, _, _, _ = get_dataset(
@@ -304,7 +237,7 @@ def experiment(
 
     all_results = []
     
-    # 为了防止跑 100 次开 100 个窗口卡死，我们只初始化一次幕布（不使用阻塞）
+    # Reuse one figure across trials to avoid GUI overhead.
     plt.ion()  
     fig_topo, ax_topo = plt.subplots(figsize=(10, 10))
     fig_topo.canvas.manager.set_window_title("MPD Auto Benchmark")
@@ -312,7 +245,7 @@ def experiment(
     for trial in range(num_trials):
         print(f"\n====================== [ STARTING TRIAL {trial+1}/{num_trials} ] ======================")
         
-        # 自动生成 5 段航点
+        # Generate sequential waypoints for this trial.
         waypoints_t, waypoints_np = generate_sequential_waypoints(env, task, 2, tensor_args, num_segments=num_segments)
         if waypoints_t is None:
             print(f"Failed to generate safe waypoints for Trial {trial+1}. Skipping.")
@@ -333,7 +266,7 @@ def experiment(
         current_homotopy_indices = None
         current_lines = {k: [] for k in VIS_STATE.keys()}
         
-        # 【新增 final_energy】
+        # Per-trial metrics.
         metrics_log = {
             "Method": planner_alg, "Trial": trial + 1, "history": [],
             "sr": 0, "time": 0.0, "fatal_error": False, "tangled": False,
@@ -348,7 +281,7 @@ def experiment(
             render_demo(fig_topo, ax_topo, iteration_count, env, history_path_list, latest_all_trajs, latest_best_traj, current_start_pos,
                         latest_optimized_traj, current_homotopy_classes, current_homotopy_energies, current_homotopy_indices,
                         VIS_STATE, current_lines, latest_best_energy, target_pos=(target_x, target_y), trial_idx=trial+1, waypoints_np=waypoints_np)
-            plt.pause(0.1) # 短暂刷新一下画面
+            plt.pause(0.1)  # Let the figure refresh.
             
             t0_seg = time.time()
             
@@ -373,7 +306,7 @@ def experiment(
             t_start_guide = ceil(start_guide_steps_fraction * model.n_diffusion_steps)
             sample_fn_kwargs = dict(guide=guide, n_guide_steps=n_guide_steps, t_start_guide=t_start_guide, noise_std_extra_schedule_fn=lambda x: 0.8)
 
-            with TimerCUDA() as timer_model_sampling:
+            with TimerCUDA():
                 trajs_normalized_iters = model.run_inference(None, hard_conds, n_samples=n_samples, horizon=n_support_points, return_chain=True, sample_fn=ddpm_sample_fn, **sample_fn_kwargs, n_diffusion_steps_without_noise=n_diffusion_steps_without_noise)
             
             _, _, trajs_final_free, _, _ = task.get_trajs_collision_and_free(dataset.unnormalize_trajectories(trajs_normalized_iters)[-1], return_indices=True)
@@ -413,10 +346,6 @@ def experiment(
                 latest_best_traj = current_homotopy_classes[0]
                 latest_best_energy = current_homotopy_energies[0]
 
-                # latest_best_traj = resample_trajectory(latest_best_traj, n_support_points)
-                
-                # # 消除时间上的加速度毛刺 (重采样分配到均匀点距)
-
                 path_length = np.sum(np.linalg.norm(np.diff(latest_best_traj, axis=0), axis=1))
                 smoothness = compute_smoothness(torch.tensor(latest_best_traj, **tensor_args).unsqueeze(0), robot).item()
                 if len(hist_for_eval) > 0:
@@ -446,9 +375,7 @@ def experiment(
                 latest_all_trajs, latest_best_traj, latest_optimized_traj, latest_best_energy = None, None, None, None
                 break
 
-        # ==========================
-        # 当前 Trial 结束：验证纠缠并保存图表
-        # ==========================
+        # Finalize this trial and save figure.
         if not metrics_log["fatal_error"] and metrics_log["sr"] > 0:
             full_hist = np.concatenate(metrics_log["history"])
             taut_traj = get_simplest_homotopy_curve(full_hist, obs_centers_np, obs_types, obs_dims)
@@ -473,35 +400,26 @@ def experiment(
             "Success_Rate": metrics_log["sr"] / num_segments,
             "Tangle_Free_Rate": 1.0 if is_fully_successful else 0.0,
             
-            # 【时间】：无条件记录！把总耗时除以实际尝试的段数，绝不丢弃任何一次运算开销
+            # Time is averaged over attempted segments.
             "Avg_Seg_Time": metrics_log["time"] / max(1, attempted_segs),
 
-            # 【轨迹质量】：仅在完美通关（无碰撞且无缠绕）时才计算，否则记为 NaN
+            # Quality metrics are reported only for full success.
             "Path_Length": np.mean(metrics_log["pl_list"]) if is_fully_successful else np.nan,
             "Smoothness": np.mean(metrics_log["sm_list"]) if is_fully_successful else np.nan,
             
-            # 拓扑能量可以保留所有记录，用来在论文中展示失败者到底绕得有多惨
+            # Keep topology energy for all outcomes.
             "Final_Topo_Energy": metrics_log["final_energy"]
         })
 
-    plt.close('all') # 跑完 100 次释放资源
+    plt.close('all')  # Release plotting resources.
 
-    # ==========================
-    # 最后打印你指定的总表 Metrics
-    # ==========================
+    # Final metrics summary.
     df = pd.DataFrame(all_results)
     
-    summary = df.groupby("Method").agg({
-        "Success_Rate": lambda x: f"{np.mean(x)*100:.1f}%",
-        "Tangle_Free_Rate": lambda x: f"{np.mean(x)*100:.1f}%",
-        "Avg_Seg_Time": lambda x: f"{np.nanmean(x):.2f}s ± {np.nanstd(x):.2f}",
-        "Path_Length": lambda x: f"{np.nanmean(x):.3f} ± {np.nanstd(x):.2f}",
-        "Smoothness": lambda x: f"{np.nanmean(x)*1000:.3f} ± {np.nanstd(x)*1000:.3f}",
-        "Final_Topo_Energy": lambda x: f"{np.nanmean(x):.2f} ± {np.nanstd(x):.2f}"
-    })
+    summary = format_time_to_success_summary(df, include_final_topo_energy=True)
     
     print("\n" + "="*95)
-    print(f"🏆 FINAL BENCHMARK REPORT ({num_trials} Trials Auto)")
+    print(f"FINAL BENCHMARK REPORT ({num_trials} Trials Auto)")
     print("="*95)
     print(summary.to_string())
     print("="*95)
