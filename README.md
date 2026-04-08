@@ -5,7 +5,7 @@ Tian, Y.; Xu, X.; Nguyen, T.-M.; Cao, M. (2026). **_Topological Motion Planning 
 [<img src="https://img.shields.io/badge/arXiv-2603.26696-b31b1b.svg?&style=for-the-badge&logo=arxiv&logoColor=white" />](https://arxiv.org/pdf/2603.26696)
 
 <p align="center">
-  <img src="figures/ani.gif" alt="TMPD denoising and selected trajectory animation" width="720" />
+  <img src="figures/ani.gif" alt="TMPD denoising and selected trajectory animation" width="360" />
 </p>
 
 ---
