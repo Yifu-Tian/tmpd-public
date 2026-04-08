@@ -9,7 +9,7 @@ Tian, Y.; Xu, X.; Nguyen, T.-M.; Cao, M. (2026). **_Topological Motion Planning 
 </p>
 
 ---
-This repository implements `TMPD` (Topological Motion Planning Diffusion), a diffusion-based method for tethered robot path planning in obstacle-rich environments, submitted to IROS 2026.
+This repository implements `TMPD` (Topological Motion Planning Diffusion), a diffusion-based method for tethered robot path planning in obstacle-rich environments.
 
 **NOTES**
 
