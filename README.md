@@ -81,12 +81,6 @@ cd scripts/inference
 bash run_benchmark.sh
 ```
 
-Interactive TMPD demo:
-```bash
-cd scripts/inference
-python inference.py
-```
-
 Optional plotting (1x4 comparison figures):
 ```bash
 cd scripts/inference
